@@ -1,7 +1,7 @@
 {
   "name": "oh-my-claude-sisyphus",
-  "version": "2.6.0",
-  "description": "Claude Code native multi-agent orchestration - compaction-resilient memory, PRD support, 19 agents, 21 skills, 358 tests",
+  "version": "2.6.1",
+  "description": "Claude Code native multi-agent orchestration - compaction-resilient memory, PRD support, 19 agents, 19 commands, 358 tests",
   "author": {
     "name": "Yeachan Heo",
     "email": "hurrc04@gmail.com",

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-01-19
+
+### Added
+
+- **Help Command** (`commands/help.md`)
+  - Comprehensive `/help` command to guide users on plugin usage
+  - Quick reference for all 21 commands and 19 agents
+  - Example workflows for common tasks
+  - Tips for effective usage and best practices
+  - Integration with plugin documentation
+
 ## [2.6.0] - 2026-01-19
 
 ### 🧠 Compaction-Resilient Memory System (Major Feature)
