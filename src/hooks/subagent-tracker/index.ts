@@ -9,7 +9,7 @@
  * - Automatic cleanup of orphaned agent state
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 
 // ============================================================================
@@ -77,10 +77,72 @@ export interface HookOutput {
 
 const STATE_FILE = 'subagent-tracking.json';
 const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_COMPLETED_AGENTS = 100;
+const LOCK_TIMEOUT_MS = 5000; // 5 second lock timeout
+const LOCK_RETRY_MS = 50; // Retry every 50ms
 
 // ============================================================================
 // State Management
 // ============================================================================
+
+/**
+ * Acquire file lock with timeout and stale lock detection
+ */
+function acquireLock(directory: string): boolean {
+  const lockPath = join(directory, '.omc', 'state', 'subagent-tracker.lock');
+  const lockDir = join(directory, '.omc', 'state');
+
+  if (!existsSync(lockDir)) {
+    mkdirSync(lockDir, { recursive: true });
+  }
+
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < LOCK_TIMEOUT_MS) {
+    try {
+      // Check for stale lock (older than timeout)
+      if (existsSync(lockPath)) {
+        const lockContent = readFileSync(lockPath, 'utf-8');
+        const lockTime = parseInt(lockContent, 10);
+        if (Date.now() - lockTime > LOCK_TIMEOUT_MS) {
+          // Stale lock, remove it
+          try { unlinkSync(lockPath); } catch {}
+        } else {
+          // Lock is held, wait and retry
+          const waitUntil = Date.now() + LOCK_RETRY_MS;
+          while (Date.now() < waitUntil) {} // Busy wait (sync context)
+          continue;
+        }
+      }
+
+      // Try to create lock atomically
+      writeFileSync(lockPath, String(Date.now()), { flag: 'wx' });
+      return true;
+    } catch (e: any) {
+      if (e.code === 'EEXIST') {
+        // Lock exists, retry
+        const waitUntil = Date.now() + LOCK_RETRY_MS;
+        while (Date.now() < waitUntil) {}
+        continue;
+      }
+      return false;
+    }
+  }
+
+  return false; // Timeout
+}
+
+/**
+ * Release file lock
+ */
+function releaseLock(directory: string): void {
+  const lockPath = join(directory, '.omc', 'state', 'subagent-tracker.lock');
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Ignore errors
+  }
+}
 
 /**
  * Get the state file path
@@ -205,87 +267,117 @@ export function getStaleAgents(state: SubagentTrackingState): SubagentInfo[] {
  * Process SubagentStart event
  */
 export function processSubagentStart(input: SubagentStartInput): HookOutput {
-  const state = readTrackingState(input.cwd);
-  const parentMode = detectParentMode(input.cwd);
+  if (!acquireLock(input.cwd)) {
+    return { continue: true }; // Fail gracefully
+  }
 
-  // Create new agent entry
-  const agentInfo: SubagentInfo = {
-    agent_id: input.agent_id,
-    agent_type: input.agent_type,
-    started_at: new Date().toISOString(),
-    parent_mode: parentMode,
-    task_description: input.prompt?.substring(0, 200), // Truncate for storage
-    status: 'running',
-  };
+  try {
+    const state = readTrackingState(input.cwd);
+    const parentMode = detectParentMode(input.cwd);
 
-  // Add to state
-  state.agents.push(agentInfo);
-  state.total_spawned++;
+    // Create new agent entry
+    const agentInfo: SubagentInfo = {
+      agent_id: input.agent_id,
+      agent_type: input.agent_type,
+      started_at: new Date().toISOString(),
+      parent_mode: parentMode,
+      task_description: input.prompt?.substring(0, 200), // Truncate for storage
+      status: 'running',
+    };
 
-  // Write updated state
-  writeTrackingState(input.cwd, state);
+    // Add to state
+    state.agents.push(agentInfo);
+    state.total_spawned++;
 
-  // Check for stale agents
-  const staleAgents = getStaleAgents(state);
+    // Write updated state
+    writeTrackingState(input.cwd, state);
 
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: 'SubagentStart',
-      additionalContext: `Agent ${input.agent_type} started (${input.agent_id})`,
-      agent_count: state.agents.filter((a) => a.status === 'running').length,
-      stale_agents: staleAgents.map((a) => a.agent_id),
-    },
-  };
+    // Check for stale agents
+    const staleAgents = getStaleAgents(state);
+
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: 'SubagentStart',
+        additionalContext: `Agent ${input.agent_type} started (${input.agent_id})`,
+        agent_count: state.agents.filter((a) => a.status === 'running').length,
+        stale_agents: staleAgents.map((a) => a.agent_id),
+      },
+    };
+  } finally {
+    releaseLock(input.cwd);
+  }
 }
 
 /**
  * Process SubagentStop event
  */
 export function processSubagentStop(input: SubagentStopInput): HookOutput {
-  const state = readTrackingState(input.cwd);
-
-  // Find the agent
-  const agentIndex = state.agents.findIndex((a) => a.agent_id === input.agent_id);
-
-  if (agentIndex !== -1) {
-    const agent = state.agents[agentIndex];
-
-    // Update agent status
-    agent.status = input.success ? 'completed' : 'failed';
-    agent.completed_at = new Date().toISOString();
-
-    // Calculate duration
-    const startTime = new Date(agent.started_at).getTime();
-    const endTime = new Date(agent.completed_at).getTime();
-    agent.duration_ms = endTime - startTime;
-
-    // Store output summary (truncated)
-    if (input.output) {
-      agent.output_summary = input.output.substring(0, 500);
-    }
-
-    // Update counters
-    if (input.success) {
-      state.total_completed++;
-    } else {
-      state.total_failed++;
-    }
+  if (!acquireLock(input.cwd)) {
+    return { continue: true }; // Fail gracefully
   }
 
-  // Write updated state
-  writeTrackingState(input.cwd, state);
+  try {
+    const state = readTrackingState(input.cwd);
 
-  const runningCount = state.agents.filter((a) => a.status === 'running').length;
+    // Find the agent
+    const agentIndex = state.agents.findIndex((a) => a.agent_id === input.agent_id);
 
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: 'SubagentStop',
-      additionalContext: `Agent ${input.agent_type} ${input.success ? 'completed' : 'failed'} (${input.agent_id})`,
-      agent_count: runningCount,
-    },
-  };
+    if (agentIndex !== -1) {
+      const agent = state.agents[agentIndex];
+
+      // Update agent status
+      agent.status = input.success ? 'completed' : 'failed';
+      agent.completed_at = new Date().toISOString();
+
+      // Calculate duration
+      const startTime = new Date(agent.started_at).getTime();
+      const endTime = new Date(agent.completed_at).getTime();
+      agent.duration_ms = endTime - startTime;
+
+      // Store output summary (truncated)
+      if (input.output) {
+        agent.output_summary = input.output.substring(0, 500);
+      }
+
+      // Update counters
+      if (input.success) {
+        state.total_completed++;
+      } else {
+        state.total_failed++;
+      }
+    }
+
+    // Evict oldest completed agents if over limit
+    const completedAgents = state.agents.filter(a => a.status === 'completed' || a.status === 'failed');
+    if (completedAgents.length > MAX_COMPLETED_AGENTS) {
+      // Sort by completed_at and keep only the most recent
+      completedAgents.sort((a, b) => {
+        const timeA = a.completed_at ? new Date(a.completed_at).getTime() : 0;
+        const timeB = b.completed_at ? new Date(b.completed_at).getTime() : 0;
+        return timeB - timeA; // Newest first
+      });
+
+      const toRemove = new Set(completedAgents.slice(MAX_COMPLETED_AGENTS).map(a => a.agent_id));
+      state.agents = state.agents.filter(a => !toRemove.has(a.agent_id));
+    }
+
+    // Write updated state
+    writeTrackingState(input.cwd, state);
+
+    const runningCount = state.agents.filter((a) => a.status === 'running').length;
+
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: 'SubagentStop',
+        additionalContext: `Agent ${input.agent_type} ${input.success ? 'completed' : 'failed'} (${input.agent_id})`,
+        agent_count: runningCount,
+      },
+    };
+  } finally {
+    releaseLock(input.cwd);
+  }
 }
 
 // ============================================================================

@@ -40,16 +40,24 @@ const SAFE_PATTERNS = [
   /^pytest/,
   /^python -m pytest/,
   /^ls( |$)/,
-  /^cat /,
-  /^head /,
-  /^tail /,
+  // REMOVED: cat, head, tail - they allow reading arbitrary files
 ];
+
+// Shell metacharacters that enable command chaining and injection
+const DANGEROUS_SHELL_CHARS = /[;&|`$()<>\n\\]/;
 
 /**
  * Check if a command matches safe patterns
  */
 export function isSafeCommand(command: string): boolean {
   const trimmed = command.trim();
+
+  // SECURITY: Reject ANY command with shell metacharacters
+  // These allow command chaining that bypasses safe pattern checks
+  if (DANGEROUS_SHELL_CHARS.test(trimmed)) {
+    return false;
+  }
+
   return SAFE_PATTERNS.some(pattern => pattern.test(trimmed));
 }
 
@@ -119,15 +127,15 @@ export function processPermissionRequest(input: PermissionRequestInput): HookOut
     };
   }
 
-  // Auto-allow when active mode is running
-  if (isActiveModeRunning(input.cwd)) {
+  // Auto-allow safe commands during active mode (NOT all commands!)
+  if (isActiveModeRunning(input.cwd) && isSafeCommand(command)) {
     return {
       continue: true,
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
         decision: {
           behavior: 'allow',
-          reason: 'Active autonomous mode detected',
+          reason: 'Safe command during active autonomous mode',
         },
       },
     };
